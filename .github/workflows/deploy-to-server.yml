@@ -1,0 +1,181 @@
+name: 部署到腾讯云服务器
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:  # 允许手动触发
+
+env:
+  SERVER_HOST: 119.29.95.149
+  SERVER_USER: root
+  DEPLOY_PATH: /opt/gin-vue-admin
+  DOCKER_COMPOSE_FILE: docker-compose.yaml
+
+jobs:
+  # ============================================
+  # 代码检查和测试
+  # ============================================
+  test:
+    name: 代码检查和测试
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      
+      - name: 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      
+      - name: 设置 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      
+      - name: 前端代码检查
+        run: |
+          cd web
+          npm install
+          npm run lint || true
+          echo "✅ 前端检查完成"
+      
+      - name: 后端代码检查
+        run: |
+          cd server
+          go mod download
+          go build -v -o server .
+          echo "✅ 后端检查完成"
+
+  # ============================================
+  # 部署到服务器
+  # ============================================
+  deploy:
+    name: 部署到服务器
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      
+      - name: 配置 SSH 密钥
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ env.SERVER_HOST }} >> ~/.ssh/known_hosts
+      
+      - name: 测试 SSH 连接
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} "echo '✅ SSH 连接成功'"
+      
+      - name: 创建部署目录
+        run: |
+          ssh ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} "mkdir -p ${{ env.DEPLOY_PATH }}"
+      
+      - name: 同步代码到服务器
+        run: |
+          # 安装 rsync（如果需要）
+          sudo apt-get update
+          sudo apt-get install -y rsync
+          
+          # 排除不需要的文件
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='web/dist' \
+            --exclude='web/node_modules' \
+            --exclude='server/go.sum' \
+            --exclude='.github' \
+            ./ ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }}:${{ env.DEPLOY_PATH }}/
+          
+          echo "✅ 代码同步完成"
+      
+      - name: 构建并部署服务
+        run: |
+          ssh ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} << 'ENDSSH'
+            set -e
+            cd ${{ env.DEPLOY_PATH }}
+            
+            echo "📦 当前目录: $(pwd)"
+            echo "📋 文件列表:"
+            ls -la
+            
+            # 检查 docker-compose 文件
+            if [ -f "deploy/docker-compose/docker-compose.yaml" ]; then
+              COMPOSE_FILE="deploy/docker-compose/docker-compose.yaml"
+            elif [ -f "docker-compose.yaml" ]; then
+              COMPOSE_FILE="docker-compose.yaml"
+            elif [ -f "docker-compose.yml" ]; then
+              COMPOSE_FILE="docker-compose.yml"
+            else
+              echo "❌ 找不到 docker-compose 文件"
+              exit 1
+            fi
+            
+            echo "🔧 使用配置文件: $COMPOSE_FILE"
+            
+            # 停止旧容器
+            echo "⏹️  停止旧容器..."
+            docker-compose -f $COMPOSE_FILE down || true
+            
+            # 构建新镜像
+            echo "🔨 构建新镜像..."
+            docker-compose -f $COMPOSE_FILE build --no-cache
+            
+            # 启动新容器
+            echo "🚀 启动新容器..."
+            docker-compose -f $COMPOSE_FILE up -d
+            
+            # 清理旧镜像
+            echo "🧹 清理旧镜像..."
+            docker image prune -f
+            
+            echo "✅ 部署完成！"
+          ENDSSH
+      
+      - name: 验证部署
+        run: |
+          ssh ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }} << 'ENDSSH'
+            echo "🔍 检查容器状态..."
+            docker ps -a
+            
+            echo ""
+            echo "📊 容器资源使用:"
+            docker stats --no-stream
+            
+            echo ""
+            echo "✅ 部署验证完成"
+          ENDSSH
+      
+      - name: 显示访问地址
+        run: |
+          echo "🎉 部署成功！"
+          echo ""
+          echo "📍 访问地址:"
+          echo "  前端: http://${{ env.SERVER_HOST }}:8080"
+          echo "  后端: http://${{ env.SERVER_HOST }}:8888"
+          echo ""
+          echo "🔧 服务器管理:"
+          echo "  SSH: ssh ${{ env.SERVER_USER }}@${{ env.SERVER_HOST }}"
+          echo "  查看日志: docker-compose -f ${{ env.DEPLOY_PATH }}/deploy/docker-compose/docker-compose.yaml logs -f"
+      
+      - name: 发送部署通知（可选）
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            STATUS="✅ 部署成功"
+            COLOR="info"
+          else
+            STATUS="❌ 部署失败"
+            COLOR="warning"
+          fi
+          
+          echo "$STATUS"
+          echo "分支: ${{ github.ref_name }}"
+          echo "提交者: ${{ github.actor }}"
+          echo "访问: http://${{ env.SERVER_HOST }}"
+
