@@ -1,4 +1,4 @@
-name: CI - 腾讯云持续集成
+ name: CI - 腾讯云持续集成
 
 on:
   push:
