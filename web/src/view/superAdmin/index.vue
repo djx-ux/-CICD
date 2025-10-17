@@ -1,3 +1,4 @@
+<!-- 超级管理员模块路由容器 -->
 <template>
   <div>
     <router-view v-slot="{ Component }">
@@ -11,10 +12,11 @@
 </template>
 
 <script setup>
-  import { useRouterStore } from '@/pinia/modules/router'
-  const routerStore = useRouterStore()
+defineOptions({
+  name: 'SuperAdmin'
+})
 
-  defineOptions({
-    name: 'SuperAdmin'
-  })
+import { useRouterStore } from '@/pinia/modules/router'
+const routerStore = useRouterStore()
 </script>
+

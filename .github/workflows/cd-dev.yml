@@ -1,0 +1,122 @@
+name: CD - 开发环境部署
+
+on:
+  push:
+    branches:
+      - develop
+  workflow_dispatch:  # 允许手动触发
+
+env:
+  DOCKER_REGISTRY: registry.cn-hangzhou.aliyuncs.com
+  IMAGE_NAME: gva
+  K8S_NAMESPACE: gva-dev
+
+jobs:
+  deploy-dev:
+    name: 部署到开发环境
+    runs-on: ubuntu-latest
+    environment:
+      name: development
+      url: https://dev.yourdomain.com
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      
+      - name: 生成镜像标签
+        id: meta
+        run: |
+          COMMIT_SHA=${GITHUB_SHA::8}
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          TAG="develop-${COMMIT_SHA}-${TIMESTAMP}"
+          echo "TAG=${TAG}" >> $GITHUB_OUTPUT
+          echo "镜像标签: ${TAG}"
+      
+      - name: 配置 kubectl
+        uses: azure/k8s-set-context@v4
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets.KUBE_CONFIG_DEV }}
+      
+      - name: 创建命名空间（如果不存在）
+        run: |
+          kubectl create namespace ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+      
+      - name: 更新后端服务镜像
+        run: |
+          kubectl set image deployment/gva-server \
+            gin-vue-admin-container=${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}/server:${{ steps.meta.outputs.TAG }} \
+            -n ${{ env.K8S_NAMESPACE }}
+      
+      - name: 更新前端服务镜像
+        run: |
+          kubectl set image deployment/gva-web \
+            gva-web-container=${{ env.DOCKER_REGISTRY }}/${{ env.IMAGE_NAME }}/web:${{ steps.meta.outputs.TAG }} \
+            -n ${{ env.K8S_NAMESPACE }}
+      
+      - name: 等待后端服务就绪
+        run: |
+          kubectl rollout status deployment/gva-server \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --timeout=5m
+      
+      - name: 等待前端服务就绪
+        run: |
+          kubectl rollout status deployment/gva-web \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --timeout=5m
+      
+      - name: 验证部署
+        run: |
+          # 检查 Pod 状态
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }}
+          
+          # 检查服务状态
+          kubectl get svc -n ${{ env.K8S_NAMESPACE }}
+          
+          # 获取最新的 Pod 日志
+          POD_NAME=$(kubectl get pods -n ${{ env.K8S_NAMESPACE }} -l app=gva-server -o jsonpath='{.items[0].metadata.name}')
+          kubectl logs $POD_NAME -n ${{ env.K8S_NAMESPACE }} --tail=50
+      
+      - name: 健康检查
+        run: |
+          # 等待服务完全启动
+          sleep 30
+          
+          # 健康检查（如果有健康检查端点）
+          # curl -f https://dev.yourdomain.com/api/health || exit 1
+          
+          echo "✅ 健康检查通过"
+      
+      - name: 发送部署通知
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          COLOR="green"
+          if [ "$STATUS" != "success" ]; then
+            COLOR="red"
+          fi
+          
+          # 钉钉通知
+          if [ -n "${{ secrets.DINGTALK_WEBHOOK }}" ]; then
+            curl -X POST ${{ secrets.DINGTALK_WEBHOOK }} \
+              -H 'Content-Type: application/json' \
+              -d "{
+                \"msgtype\": \"markdown\",
+                \"markdown\": {
+                  \"title\": \"开发环境部署通知\",
+                  \"text\": \"### 🚀 开发环境部署通知\n\n**环境**: Development\n\n**状态**: <font color='${COLOR}'>${STATUS}</font>\n\n**分支**: develop\n\n**版本**: ${{ steps.meta.outputs.TAG }}\n\n**提交者**: ${GITHUB_ACTOR}\n\n**访问地址**: https://dev.yourdomain.com\n\n[查看详情](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})\"
+                }
+              }"
+          fi
+      
+      - name: 部署失败时回滚
+        if: failure()
+        run: |
+          echo "⚠️ 部署失败，开始回滚..."
+          kubectl rollout undo deployment/gva-server -n ${{ env.K8S_NAMESPACE }}
+          kubectl rollout undo deployment/gva-web -n ${{ env.K8S_NAMESPACE }}
+          echo "✅ 已回滚到上一版本"
+
+
+

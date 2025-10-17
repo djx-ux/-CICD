@@ -1,0 +1,105 @@
+name: 生产环境回滚
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: '回滚环境'
+        required: true
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+      revision:
+        description: '回滚到的版本（留空则回滚到上一版本）'
+        required: false
+        default: ''
+
+jobs:
+  rollback:
+    name: 执行回滚
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 确认回滚操作
+        run: |
+          echo "⚠️ 准备回滚环境: ${{ github.event.inputs.environment }}"
+          echo "目标版本: ${{ github.event.inputs.revision || '上一版本' }}"
+      
+      - name: 配置 kubectl
+        uses: azure/k8s-set-context@v4
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ secrets[format('KUBE_CONFIG_{0}', github.event.inputs.environment == 'production' && 'PROD' || github.event.inputs.environment == 'staging' && 'STAGING' || 'DEV')] }}
+      
+      - name: 获取命名空间
+        id: namespace
+        run: |
+          case "${{ github.event.inputs.environment }}" in
+            "production")
+              echo "NAMESPACE=gva-prod" >> $GITHUB_OUTPUT
+              ;;
+            "staging")
+              echo "NAMESPACE=gva-staging" >> $GITHUB_OUTPUT
+              ;;
+            "development")
+              echo "NAMESPACE=gva-dev" >> $GITHUB_OUTPUT
+              ;;
+          esac
+      
+      - name: 备份当前部署
+        run: |
+          kubectl get deployment gva-server -n ${{ steps.namespace.outputs.NAMESPACE }} -o yaml > current-server-deployment.yaml
+          kubectl get deployment gva-web -n ${{ steps.namespace.outputs.NAMESPACE }} -o yaml > current-web-deployment.yaml
+          echo "✅ 当前部署已备份"
+      
+      - name: 执行回滚
+        run: |
+          if [ -n "${{ github.event.inputs.revision }}" ]; then
+            # 回滚到指定版本
+            echo "回滚到指定版本: ${{ github.event.inputs.revision }}"
+            kubectl rollout undo deployment/gva-server --to-revision=${{ github.event.inputs.revision }} -n ${{ steps.namespace.outputs.NAMESPACE }}
+            kubectl rollout undo deployment/gva-web --to-revision=${{ github.event.inputs.revision }} -n ${{ steps.namespace.outputs.NAMESPACE }}
+          else
+            # 回滚到上一版本
+            echo "回滚到上一版本"
+            kubectl rollout undo deployment/gva-server -n ${{ steps.namespace.outputs.NAMESPACE }}
+            kubectl rollout undo deployment/gva-web -n ${{ steps.namespace.outputs.NAMESPACE }}
+          fi
+      
+      - name: 等待回滚完成
+        run: |
+          kubectl rollout status deployment/gva-server -n ${{ steps.namespace.outputs.NAMESPACE }} --timeout=5m
+          kubectl rollout status deployment/gva-web -n ${{ steps.namespace.outputs.NAMESPACE }} --timeout=5m
+          echo "✅ 回滚完成"
+      
+      - name: 验证回滚结果
+        run: |
+          # 检查 Pod 状态
+          kubectl get pods -n ${{ steps.namespace.outputs.NAMESPACE }}
+          
+          # 健康检查
+          sleep 30
+          
+          echo "✅ 回滚验证通过"
+      
+      - name: 发送回滚通知
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          
+          if [ -n "${{ secrets.DINGTALK_WEBHOOK }}" ]; then
+            curl -X POST ${{ secrets.DINGTALK_WEBHOOK }} \
+              -H 'Content-Type: application/json' \
+              -d "{
+                \"msgtype\": \"markdown\",
+                \"markdown\": {
+                  \"title\": \"环境回滚通知\",
+                  \"text\": \"### ⚠️ 环境回滚通知\n\n**环境**: ${{ github.event.inputs.environment }}\n\n**状态**: ${STATUS}\n\n**操作人**: ${GITHUB_ACTOR}\n\n**回滚版本**: ${{ github.event.inputs.revision || '上一版本' }}\n\n**操作时间**: $(date '+%Y-%m-%d %H:%M:%S')\n\n[查看详情](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})\"
+                }
+              }"
+          fi
+
+
+

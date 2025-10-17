@@ -31,6 +31,7 @@ export default ({ mode }) => {
 
   const alias = {
     '@': path.resolve(__dirname, './src'),
+    '@systemTools': path.resolve(__dirname, './src/view/systemTools'),
     vue$: 'vue/dist/vue.runtime.esm-bundler.js'
   }
 

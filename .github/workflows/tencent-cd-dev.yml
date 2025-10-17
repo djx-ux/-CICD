@@ -1,0 +1,211 @@
+name: CD - 腾讯云开发环境部署
+
+on:
+  workflow_run:
+    workflows: ["CI - 腾讯云持续集成"]
+    types:
+      - completed
+    branches:
+      - develop
+  workflow_dispatch:  # 允许手动触发
+
+env:
+  K8S_NAMESPACE: gva-dev
+
+jobs:
+  deploy-dev:
+    name: 部署到腾讯云开发环境
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    environment:
+      name: development
+      url: https://dev.yourdomain.com
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      
+      - name: 生成镜像标签
+        id: meta
+        run: |
+          COMMIT_SHA=${GITHUB_SHA::8}
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          TAG="develop-${COMMIT_SHA}-${TIMESTAMP}"
+          echo "TAG=${TAG}" >> $GITHUB_OUTPUT
+          echo "🏷️ 部署标签: ${TAG}"
+      
+      - name: 配置 kubectl
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG_DEV }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+      
+      - name: 验证集群连接
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+      
+      - name: 创建命名空间（如果不存在）
+        run: |
+          kubectl create namespace ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+      
+      - name: 确保镜像拉取密钥存在
+        run: |
+          # 检查密钥是否存在
+          if ! kubectl get secret tcr-secret -n ${{ env.K8S_NAMESPACE }} &> /dev/null; then
+            echo "创建镜像拉取密钥..."
+            kubectl create secret docker-registry tcr-secret \
+              --docker-server=${{ secrets.DOCKER_REGISTRY }} \
+              --docker-username=${{ secrets.DOCKER_USERNAME }} \
+              --docker-password=${{ secrets.DOCKER_PASSWORD }} \
+              --namespace=${{ env.K8S_NAMESPACE }}
+          else
+            echo "✅ 镜像拉取密钥已存在"
+          fi
+      
+      - name: 更新后端服务镜像
+        run: |
+          SERVER_IMAGE="${{ secrets.DOCKER_REGISTRY }}/gva/server:${{ steps.meta.outputs.TAG }}"
+          echo "📦 更新后端镜像: ${SERVER_IMAGE}"
+          
+          kubectl set image deployment/gva-server \
+            gin-vue-admin-container="${SERVER_IMAGE}" \
+            -n ${{ env.K8S_NAMESPACE }} || \
+          kubectl create deployment gva-server \
+            --image="${SERVER_IMAGE}" \
+            -n ${{ env.K8S_NAMESPACE }}
+      
+      - name: 更新前端服务镜像
+        run: |
+          WEB_IMAGE="${{ secrets.DOCKER_REGISTRY }}/gva/web:${{ steps.meta.outputs.TAG }}"
+          echo "📦 更新前端镜像: ${WEB_IMAGE}"
+          
+          kubectl set image deployment/gva-web \
+            gva-web-container="${WEB_IMAGE}" \
+            -n ${{ env.K8S_NAMESPACE }} || \
+          kubectl create deployment gva-web \
+            --image="${WEB_IMAGE}" \
+            -n ${{ env.K8S_NAMESPACE }}
+      
+      - name: 等待后端服务就绪
+        run: |
+          echo "⏳ 等待后端服务就绪..."
+          kubectl rollout status deployment/gva-server \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --timeout=10m
+          echo "✅ 后端服务就绪"
+      
+      - name: 等待前端服务就绪
+        run: |
+          echo "⏳ 等待前端服务就绪..."
+          kubectl rollout status deployment/gva-web \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --timeout=10m
+          echo "✅ 前端服务就绪"
+      
+      - name: 验证部署
+        run: |
+          echo "🔍 验证部署状态..."
+          echo ""
+          echo "=== Pod 状态 ==="
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }} -o wide
+          echo ""
+          echo "=== Service 状态 ==="
+          kubectl get svc -n ${{ env.K8S_NAMESPACE }}
+          echo ""
+          echo "=== Deployment 状态 ==="
+          kubectl get deployment -n ${{ env.K8S_NAMESPACE }}
+      
+      - name: 获取服务地址
+        id: service
+        run: |
+          # 获取 LoadBalancer 外部IP或域名
+          EXTERNAL_IP=$(kubectl get svc gva-web -n ${{ env.K8S_NAMESPACE }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+          EXTERNAL_HOSTNAME=$(kubectl get svc gva-web -n ${{ env.K8S_NAMESPACE }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          
+          if [ -n "$EXTERNAL_IP" ]; then
+            ACCESS_URL="http://${EXTERNAL_IP}"
+          elif [ -n "$EXTERNAL_HOSTNAME" ]; then
+            ACCESS_URL="http://${EXTERNAL_HOSTNAME}"
+          else
+            ACCESS_URL="使用 kubectl port-forward 访问"
+          fi
+          
+          echo "ACCESS_URL=${ACCESS_URL}" >> $GITHUB_OUTPUT
+          echo "📍 访问地址: ${ACCESS_URL}"
+      
+      - name: 健康检查
+        run: |
+          echo "🏥 执行健康检查..."
+          sleep 30
+          
+          # 检查 Pod 健康状态
+          RUNNING_PODS=$(kubectl get pods -n ${{ env.K8S_NAMESPACE }} --field-selector=status.phase=Running -o json | jq '.items | length')
+          echo "✅ 运行中的 Pod 数量: ${RUNNING_PODS}"
+          
+          if [ "$RUNNING_PODS" -eq 0 ]; then
+            echo "❌ 没有正在运行的 Pod"
+            exit 1
+          fi
+          
+          echo "✅ 健康检查通过"
+      
+      - name: 显示最新日志
+        if: always()
+        run: |
+          echo "📋 后端服务日志（最近50行）:"
+          kubectl logs -n ${{ env.K8S_NAMESPACE }} -l app=gva-server --tail=50 || true
+          echo ""
+          echo "📋 前端服务日志（最近50行）:"
+          kubectl logs -n ${{ env.K8S_NAMESPACE }} -l app=gva-web --tail=50 || true
+      
+      - name: 发送部署成功通知
+        if: success()
+        run: |
+          # 企业微信通知
+          if [ -n "${{ secrets.WECOM_WEBHOOK }}" ]; then
+            curl -X POST ${{ secrets.WECOM_WEBHOOK }} \
+              -H 'Content-Type: application/json' \
+              -d "{
+                \"msgtype\": \"markdown\",
+                \"markdown\": {
+                  \"content\": \"## 🚀 开发环境部署成功\n\n>环境: **Development**\n>分支: **develop**\n>版本: **${{ steps.meta.outputs.TAG }}**\n>提交者: **${GITHUB_ACTOR}**\n>访问地址: **${{ steps.service.outputs.ACCESS_URL }}**\n\n[查看详情](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})\"
+                }
+              }"
+          fi
+          
+          # 钉钉通知
+          if [ -n "${{ secrets.DINGTALK_WEBHOOK }}" ]; then
+            curl -X POST ${{ secrets.DINGTALK_WEBHOOK }} \
+              -H 'Content-Type: application/json' \
+              -d "{
+                \"msgtype\": \"markdown\",
+                \"markdown\": {
+                  \"title\": \"开发环境部署成功\",
+                  \"text\": \"### 🚀 开发环境部署成功\n\n**环境**: Development\n\n**分支**: develop\n\n**版本**: ${{ steps.meta.outputs.TAG }}\n\n**提交者**: ${GITHUB_ACTOR}\n\n**访问地址**: ${{ steps.service.outputs.ACCESS_URL }}\n\n[查看详情](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})\"
+                }
+              }"
+          fi
+      
+      - name: 部署失败时回滚
+        if: failure()
+        run: |
+          echo "⚠️ 部署失败，开始回滚..."
+          
+          kubectl rollout undo deployment/gva-server -n ${{ env.K8S_NAMESPACE }} || true
+          kubectl rollout undo deployment/gva-web -n ${{ env.K8S_NAMESPACE }} || true
+          
+          echo "✅ 已回滚到上一版本"
+          
+          # 发送失败通知
+          if [ -n "${{ secrets.WECOM_WEBHOOK }}" ]; then
+            curl -X POST ${{ secrets.WECOM_WEBHOOK }} \
+              -H 'Content-Type: application/json' \
+              -d "{
+                \"msgtype\": \"text\",
+                \"text\": {
+                  \"content\": \"❌ 开发环境部署失败！\n版本: ${{ steps.meta.outputs.TAG }}\n已自动回滚到上一版本\n查看详情: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"
+                }
+              }"
+          fi
+

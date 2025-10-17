@@ -1,0 +1,225 @@
+{
+  "mcpServers": {
+    "halley-comet-admin": {
+      "command": "node",
+      "args": ["-e", "console.log('哈雷彗星后台管理系统 MCP 服务器已启动')"],
+      "env": {
+        "PROJECT_NAME": "哈雷彗星后台管理系统",
+        "PROJECT_VERSION": "2.8.5",
+        "TECH_STACK": "Vue3+Vite+ElementPlus+Pinia+UnoCSS"
+      }
+    }
+  },
+  "projectConfig": {
+    "name": "哈雷彗星后台管理系统",
+    "version": "2.8.5",
+    "description": "基于 Vue 3 + Vite + Element Plus 的企业级后台管理系统",
+    "techStack": {
+      "frontend": "Vue 3.5.7",
+      "build": "Vite 6.2.3",
+      "ui": "Element Plus 2.10.2",
+      "state": "Pinia 2.2.2",
+      "router": "Vue Router 4.4.3",
+      "css": "UnoCSS 66.4.2",
+      "http": "Axios 1.8.2",
+      "charts": "ECharts 5.5.1"
+    },
+    "architecture": {
+      "pattern": "前后端分离",
+      "apiStyle": "RESTful",
+      "authMode": "JWT + RBAC",
+      "stateManagement": "Pinia模块化",
+      "routeMode": "动态路由",
+      "cssFramework": "UnoCSS + SCSS"
+    },
+    "codeStandards": {
+      "vueVersion": "Vue 3 Composition API",
+      "scriptSetup": true,
+      "typescript": "JSDoc注释",
+      "eslint": true,
+      "prettier": true,
+      "componentNaming": "PascalCase",
+      "variableNaming": "camelCase",
+      "constantNaming": "UPPER_SNAKE_CASE",
+      "cssNaming": "kebab-case"
+    },
+    "businessRules": {
+      "inputRestriction": {
+        "guildName": "英文字符和数字",
+        "uid": "英文字符、数字、下划线、横线",
+        "caseInsensitive": true,
+        "duplicateCheck": true
+      },
+      "defaultValues": {
+        "guildGroup": "默认分组",
+        "selectFirst": true
+      },
+      "validation": {
+        "realTimeFilter": true,
+        "frontendValidation": true,
+        "backendValidation": true
+      }
+    },
+    "permissions": {
+      "levels": ["路由级", "组件级", "按钮级"],
+      "directive": "v-auth",
+      "roles": ["admin", "user", "guest"],
+      "authCheck": "authorityId"
+    },
+    "performance": {
+      "lazyLoading": true,
+      "keepAlive": true,
+      "virtualScroll": true,
+      "debounce": true,
+      "memo": true
+    },
+    "responsive": {
+      "mobile": true,
+      "tablet": true,
+      "desktop": true,
+      "breakpoints": {
+        "sm": "640px",
+        "md": "768px",
+        "lg": "1024px",
+        "xl": "1280px"
+      }
+    }
+  },
+  "developmentRules": {
+    "mandatory": {
+      "useCompositionAPI": true,
+      "useScriptSetup": true,
+      "defineComponentName": true,
+      "includeErrorHandling": true,
+      "useUnoCSS": true,
+      "addJSDocComments": true,
+      "followNamingConvention": true,
+      "supportResponsive": true
+    },
+    "forbidden": {
+      "optionsAPI": true,
+      "directDOMManipulation": true,
+      "inlineStyles": true,
+      "globalVariables": true,
+      "unsafeVHtml": true,
+      "unhandledPromises": true,
+      "magicNumbers": true
+    },
+    "templates": {
+      "vueComponent": {
+        "structure": "template + script setup + style scoped",
+        "imports": "按类型分组导入",
+        "defineOptions": "必须定义组件名",
+        "reactiveData": "使用 ref/reactive",
+        "methods": "包含完整错误处理",
+        "lifecycle": "使用组合式API钩子"
+      },
+      "apiFunction": {
+        "structure": "JSDoc + export const",
+        "errorHandling": "try-catch包装",
+        "naming": "动词+名词",
+        "swagger": "包含Swagger注释"
+      },
+      "piniaStore": {
+        "structure": "defineStore + 组合式函数",
+        "naming": "useXxxStore",
+        "return": "返回状态和方法",
+        "persist": "支持持久化"
+      }
+    },
+    "styling": {
+      "priority": "UnoCSS > SCSS > 内联",
+      "responsive": "移动端优先",
+      "darkMode": "支持深色模式",
+      "naming": "BEM + kebab-case",
+      "prefix": "gva-"
+    },
+    "validation": {
+      "inputFilter": "实时字符过滤",
+      "customValidator": "自定义验证函数",
+      "errorMessage": "详细错误提示",
+      "duplicateCheck": "不区分大小写"
+    }
+  },
+  "aiInstructions": {
+    "codeGeneration": {
+      "alwaysUse": [
+        "Vue 3 Composition API",
+        "<script setup> 语法",
+        "defineOptions 定义组件名",
+        "完整的错误处理",
+        "UnoCSS 原子类",
+        "JSDoc 类型注释",
+        "响应式设计支持"
+      ],
+      "neverUse": [
+        "Vue 2 Options API",
+        "直接 DOM 操作",
+        "内联样式",
+        "全局变量",
+        "不安全的 v-html",
+        "未处理的 Promise"
+      ],
+      "patterns": {
+        "errorHandling": "try-catch-finally + ElMessage",
+        "loading": "ref(false) + 异步操作包装",
+        "validation": "自定义验证函数 + rules对象",
+        "api": "service + JSDoc + Swagger注释"
+      }
+    },
+    "businessLogic": {
+      "inputRestriction": {
+        "guildName": "只允许英文字符和数字",
+        "uid": "允许英文、数字、下划线、横线",
+        "realTimeFilter": "使用@input事件过滤"
+      },
+      "defaultBehavior": {
+        "selectDefault": "下拉选择默认选中第一项",
+        "guildGroup": "默认选择'默认分组'",
+        "formReset": "提供完整重置功能"
+      },
+      "duplicateCheck": {
+        "caseInsensitive": "转换为小写比较",
+        "realTime": "输入时实时检查",
+        "errorMessage": "提供明确的重复提示"
+      }
+    }
+  },
+  "fileStructure": {
+    "src": {
+      "api": "API接口层，按模块分文件",
+      "components": "公共组件，可复用",
+      "pinia": "状态管理，模块化store",
+      "router": "路由配置，支持动态路由",
+      "view": "页面组件，按功能分目录",
+      "style": "全局样式，UnoCSS+SCSS",
+      "utils": "工具函数，纯函数优先"
+    },
+    "naming": {
+      "components": "PascalCase.vue",
+      "pages": "index.vue (目录名表示功能)",
+      "api": "moduleName.js",
+      "store": "moduleName.js",
+      "utils": "functionName.js"
+    }
+  },
+  "qualityStandards": {
+    "performance": {
+      "bundleSize": "< 2MB",
+      "firstLoad": "< 3s",
+      "routeSwitch": "< 200ms",
+      "formResponse": "< 100ms"
+    },
+    "compatibility": {
+      "browsers": ["Chrome >= 60", "Firefox >= 54", "Safari >= 10.1", "Edge >= 15"],
+      "devices": ["Desktop", "Tablet", "Mobile"],
+      "responsive": ["320px+", "768px+", "1024px+", "1280px+"]
+    },
+    "security": {
+      "xssProtection": "使用v-text而非v-html",
+      "inputValidation": "前端+后端双重验证",
+      "permissionControl": "三级权限控制",
+      "dataProtection": "不存储敏感信息"
+    }
+  }
+}

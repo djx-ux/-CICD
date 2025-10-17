@@ -1,5 +1,5 @@
 {
-  "name": "gin-vue-admin",
+  "name": "哈雷彗星后台管理系统",
   "version": "2.8.5",
   "private": true,
   "scripts": {
@@ -35,6 +35,7 @@
     "mitt": "^3.0.1",
     "npm": "^11.3.0",
     "nprogress": "^0.2.0",
+    "nvm": "^0.0.4",
     "path": "^0.12.7",
     "pinia": "^2.2.2",
     "qs": "^6.13.0",

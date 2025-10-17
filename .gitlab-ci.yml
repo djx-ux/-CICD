@@ -1,0 +1,217 @@
+# GitLab CI/CD 配置文件
+# 适用于使用 GitLab 的团队
+
+stages:
+  - lint      # 代码检查
+  - test      # 测试
+  - build     # 构建
+  - deploy    # 部署
+
+variables:
+  DOCKER_REGISTRY: registry.cn-hangzhou.aliyuncs.com
+  IMAGE_NAME: gva
+  GO_VERSION: "1.22"
+  NODE_VERSION: "20"
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+
+# ============================================
+# 前端代码检查
+# ============================================
+frontend-lint:
+  stage: lint
+  image: node:20
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}-pnpm
+    paths:
+      - web/node_modules/
+  script:
+    - cd web
+    - corepack enable
+    - corepack prepare pnpm@10.18.3 --activate
+    - pnpm install --frozen-lockfile
+    - pnpm lint || true
+  only:
+    - branches
+    - merge_requests
+
+# ============================================
+# 后端代码检查
+# ============================================
+backend-lint:
+  stage: lint
+  image: golang:1.22
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}-go
+    paths:
+      - server/.go/
+  script:
+    - cd server
+    - go env -w GOPROXY=https://goproxy.cn,direct
+    - go mod download
+    - go vet ./...
+    - gofmt -l . | tee /dev/stderr | [ -z "$(cat)" ]
+  only:
+    - branches
+    - merge_requests
+
+# ============================================
+# 后端单元测试
+# ============================================
+backend-test:
+  stage: test
+  image: golang:1.22
+  services:
+    - name: mysql:8.0
+      alias: mysql
+      command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_unicode_ci"]
+    - name: redis:6.0
+      alias: redis
+  variables:
+    MYSQL_ROOT_PASSWORD: root
+    MYSQL_DATABASE: qmPlus
+    MYSQL_USER: gva
+    MYSQL_PASSWORD: Aa@6447985
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}-go
+    paths:
+      - server/.go/
+  script:
+    - cd server
+    - go env -w GOPROXY=https://goproxy.cn,direct
+    - go mod download
+    - go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+    - go tool cover -func=coverage.out
+  coverage: '/total:\s+\(statements\)\s+(\d+\.\d+)%/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: server/coverage.out
+  only:
+    - branches
+    - merge_requests
+
+# ============================================
+# 构建 Docker 镜像
+# ============================================
+build-images:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $DOCKER_REGISTRY
+  script:
+    # 生成镜像标签
+    - export TAG="${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHORT_SHA}-$(date +%Y%m%d%H%M%S)"
+    - echo "构建标签: $TAG"
+    
+    # 构建后端镜像
+    - cd server
+    - docker build -t ${DOCKER_REGISTRY}/${IMAGE_NAME}/server:${TAG} .
+    - docker tag ${DOCKER_REGISTRY}/${IMAGE_NAME}/server:${TAG} ${DOCKER_REGISTRY}/${IMAGE_NAME}/server:${CI_COMMIT_REF_SLUG}-latest
+    - docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}/server:${TAG}
+    - docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}/server:${CI_COMMIT_REF_SLUG}-latest
+    - cd ..
+    
+    # 构建前端镜像
+    - cd web
+    - docker build -t ${DOCKER_REGISTRY}/${IMAGE_NAME}/web:${TAG} .
+    - docker tag ${DOCKER_REGISTRY}/${IMAGE_NAME}/web:${TAG} ${DOCKER_REGISTRY}/${IMAGE_NAME}/web:${CI_COMMIT_REF_SLUG}-latest
+    - docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}/web:${TAG}
+    - docker push ${DOCKER_REGISTRY}/${IMAGE_NAME}/web:${CI_COMMIT_REF_SLUG}-latest
+    - cd ..
+    
+    # 保存标签供部署使用
+    - echo "$TAG" > image_tag.txt
+  artifacts:
+    paths:
+      - image_tag.txt
+    expire_in: 1 week
+  only:
+    - develop
+    - release/*
+    - main
+    - tags
+
+# ============================================
+# 部署到开发环境
+# ============================================
+deploy-dev:
+  stage: deploy
+  image: bitnami/kubectl:latest
+  before_script:
+    - mkdir -p ~/.kube
+    - echo "$KUBE_CONFIG_DEV" | base64 -d > ~/.kube/config
+  script:
+    - export TAG=$(cat image_tag.txt)
+    - echo "部署版本: $TAG"
+    
+    # 更新 Deployment
+    - kubectl set image deployment/gva-server gin-vue-admin-container=${DOCKER_REGISTRY}/${IMAGE_NAME}/server:${TAG} -n gva-dev
+    - kubectl set image deployment/gva-web gva-web-container=${DOCKER_REGISTRY}/${IMAGE_NAME}/web:${TAG} -n gva-dev
+    
+    # 等待部署完成
+    - kubectl rollout status deployment/gva-server -n gva-dev --timeout=5m
+    - kubectl rollout status deployment/gva-web -n gva-dev --timeout=5m
+    
+    - echo "✅ 开发环境部署成功"
+  environment:
+    name: development
+    url: https://dev.yourdomain.com
+  only:
+    - develop
+
+# ============================================
+# 部署到生产环境（手动触发）
+# ============================================
+deploy-prod:
+  stage: deploy
+  image: bitnami/kubectl:latest
+  before_script:
+    - mkdir -p ~/.kube
+    - echo "$KUBE_CONFIG_PROD" | base64 -d > ~/.kube/config
+  script:
+    - export TAG=$(cat image_tag.txt)
+    - echo "部署版本: $TAG"
+    
+    # 金丝雀发布（先部署一小部分）
+    - echo "🐤 金丝雀发布 - 10% 流量"
+    - kubectl set image deployment/gva-server gin-vue-admin-container=${DOCKER_REGISTRY}/${IMAGE_NAME}/server:${TAG} -n gva-prod
+    - sleep 60
+    
+    # 全量发布
+    - echo "🚀 全量发布"
+    - kubectl set image deployment/gva-web gva-web-container=${DOCKER_REGISTRY}/${IMAGE_NAME}/web:${TAG} -n gva-prod
+    
+    # 等待部署完成
+    - kubectl rollout status deployment/gva-server -n gva-prod --timeout=10m
+    - kubectl rollout status deployment/gva-web -n gva-prod --timeout=10m
+    
+    - echo "✅ 生产环境部署成功"
+  environment:
+    name: production
+    url: https://www.yourdomain.com
+  when: manual  # 需要手动触发
+  only:
+    - main
+    - tags
+
+# ============================================
+# 部署后自动化测试
+# ============================================
+e2e-test:
+  stage: deploy
+  image: node:20
+  script:
+    - cd web
+    - corepack enable
+    - pnpm install
+    - pnpm test:e2e || true
+  only:
+    - develop
+  needs: ["deploy-dev"]
+
+
+

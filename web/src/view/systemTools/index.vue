@@ -8,13 +8,23 @@
       </transition>
     </router-view>
   </div>
+  
 </template>
 
 <script setup>
-  import { useRouterStore } from '@/pinia/modules/router'
-  const routerStore = useRouterStore()
-
-  defineOptions({
-    name: 'System'
-  })
+defineOptions({
+  // 路由容器名称用于 Keep-Alive
+  name: 'AnchorModule'
+})
+import { useRouterStore } from '@/pinia/modules/router'
+const routerStore = useRouterStore()
 </script>
+
+<style scoped>
+</style>
+
+
+
+
+
+

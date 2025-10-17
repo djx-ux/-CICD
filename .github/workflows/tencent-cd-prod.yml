@@ -1,0 +1,310 @@
+name: CD - 腾讯云生产环境部署
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:  # 允许手动触发
+    inputs:
+      version:
+        description: '部署版本（镜像标签）'
+        required: true
+        default: 'latest'
+
+env:
+  K8S_NAMESPACE: gva-prod
+
+jobs:
+  # ============================================
+  # 生产环境部署（需审批）
+  # ============================================
+  deploy-production:
+    name: 部署到腾讯云生产环境
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://www.yourdomain.com
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      
+      - name: 生成部署版本
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.version }}"
+          elif [[ ${GITHUB_REF} == refs/tags/* ]]; then
+            TAG=${GITHUB_REF#refs/tags/}
+          else
+            COMMIT_SHA=${GITHUB_SHA::8}
+            TIMESTAMP=$(date +%Y%m%d%H%M%S)
+            TAG="main-${COMMIT_SHA}-${TIMESTAMP}"
+          fi
+          echo "TAG=${TAG}" >> $GITHUB_OUTPUT
+          echo "🏷️ 部署版本: ${TAG}"
+      
+      - name: 配置 kubectl
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG_PROD }}" | base64 -d > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+      
+      - name: 验证集群连接
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+      
+      - name: 创建部署备份
+        run: |
+          echo "💾 创建部署备份..."
+          
+          # 备份当前部署配置
+          kubectl get deployment gva-server -n ${{ env.K8S_NAMESPACE }} -o yaml > backup-server-deployment.yaml 2>/dev/null || echo "后端服务不存在"
+          kubectl get deployment gva-web -n ${{ env.K8S_NAMESPACE }} -o yaml > backup-web-deployment.yaml 2>/dev/null || echo "前端服务不存在"
+          
+          echo "✅ 部署配置已备份"
+      
+      - name: 上传备份配置
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-backup-${{ steps.version.outputs.TAG }}
+          path: |
+            backup-*.yaml
+          retention-days: 90
+      
+      - name: 确保命名空间和密钥存在
+        run: |
+          # 创建命名空间
+          kubectl create namespace ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+          
+          # 创建镜像拉取密钥
+          if ! kubectl get secret tcr-secret -n ${{ env.K8S_NAMESPACE }} &> /dev/null; then
+            echo "创建镜像拉取密钥..."
+            kubectl create secret docker-registry tcr-secret \
+              --docker-server=${{ secrets.DOCKER_REGISTRY }} \
+              --docker-username=${{ secrets.DOCKER_USERNAME }} \
+              --docker-password=${{ secrets.DOCKER_PASSWORD }} \
+              --namespace=${{ env.K8S_NAMESPACE }}
+          fi
+      
+      - name: 金丝雀发布 - 部署新版本
+        run: |
+          echo "🐤 开始金丝雀发布..."
+          
+          SERVER_IMAGE="${{ secrets.DOCKER_REGISTRY }}/gva/server:${{ steps.version.outputs.TAG }}"
+          
+          # 更新后端镜像（金丝雀阶段）
+          kubectl set image deployment/gva-server \
+            gin-vue-admin-container="${SERVER_IMAGE}" \
+            -n ${{ env.K8S_NAMESPACE }}
+          
+          # 等待部分 Pod 更新
+          echo "⏱️ 等待金丝雀版本启动..."
+          sleep 60
+      
+      - name: 金丝雀健康检查
+        run: |
+          echo "🏥 执行金丝雀健康检查..."
+          
+          # 检查新 Pod 状态
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }} -l app=gva-server
+          
+          # 检查运行中的 Pod 数量
+          RUNNING_PODS=$(kubectl get pods -n ${{ env.K8S_NAMESPACE }} -l app=gva-server --field-selector=status.phase=Running -o json | jq '.items | length')
+          
+          if [ "$RUNNING_PODS" -eq 0 ]; then
+            echo "❌ 金丝雀版本部署失败，没有正在运行的 Pod"
+            exit 1
+          fi
+          
+          echo "✅ 金丝雀版本运行正常 (${RUNNING_PODS} 个 Pod)"
+          
+          # 检查最新 Pod 的日志是否有严重错误
+          LATEST_POD=$(kubectl get pods -n ${{ env.K8S_NAMESPACE }} -l app=gva-server --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}')
+          echo "📋 检查最新 Pod 日志: ${LATEST_POD}"
+          
+          ERROR_COUNT=$(kubectl logs ${LATEST_POD} -n ${{ env.K8S_NAMESPACE }} --tail=100 | grep -i "error\|fatal\|panic" | wc -l || echo 0)
+          
+          if [ "$ERROR_COUNT" -gt 10 ]; then
+            echo "❌ 检测到大量错误日志 (${ERROR_COUNT} 条)"
+            kubectl logs ${LATEST_POD} -n ${{ env.K8S_NAMESPACE }} --tail=50
+            exit 1
+          fi
+          
+          echo "✅ 金丝雀健康检查通过"
+      
+      - name: 全量发布
+        run: |
+          echo "🚀 开始全量发布..."
+          
+          WEB_IMAGE="${{ secrets.DOCKER_REGISTRY }}/gva/web:${{ steps.version.outputs.TAG }}"
+          
+          # 更新前端镜像
+          kubectl set image deployment/gva-web \
+            gva-web-container="${WEB_IMAGE}" \
+            -n ${{ env.K8S_NAMESPACE }}
+          
+          # 等待所有服务完全就绪
+          echo "⏳ 等待后端服务完全就绪..."
+          kubectl rollout status deployment/gva-server -n ${{ env.K8S_NAMESPACE }} --timeout=15m
+          
+          echo "⏳ 等待前端服务完全就绪..."
+          kubectl rollout status deployment/gva-web -n ${{ env.K8S_NAMESPACE }} --timeout=15m
+          
+          echo "✅ 全量发布完成"
+      
+      - name: 生产环境验证
+        run: |
+          echo "🔍 执行生产环境验证..."
+          
+          # 等待服务完全稳定
+          echo "⏱️ 等待服务稳定（60秒）..."
+          sleep 60
+          
+          echo ""
+          echo "=== Pod 状态 ==="
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }} -o wide
+          
+          echo ""
+          echo "=== Service 状态 ==="
+          kubectl get svc -n ${{ env.K8S_NAMESPACE }}
+          
+          echo ""
+          echo "=== Deployment 状态 ==="
+          kubectl get deployment -n ${{ env.K8S_NAMESPACE }}
+          
+          # 检查所有 Pod 是否健康
+          NOT_READY=$(kubectl get pods -n ${{ env.K8S_NAMESPACE }} --field-selector=status.phase!=Running -o json | jq '.items | length')
+          
+          if [ "$NOT_READY" -gt 0 ]; then
+            echo "❌ 有 ${NOT_READY} 个 Pod 状态异常"
+            kubectl get pods -n ${{ env.K8S_NAMESPACE }} --field-selector=status.phase!=Running
+            exit 1
+          fi
+          
+          echo "✅ 所有 Pod 状态正常"
+          
+          # 如果有健康检查端点，可以在这里添加
+          # HEALTH_CHECK_URL="https://www.yourdomain.com/api/health"
+          # HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" ${HEALTH_CHECK_URL})
+          # if [ "$HTTP_CODE" != "200" ]; then
+          #   echo "❌ 健康检查失败: HTTP ${HTTP_CODE}"
+          #   exit 1
+          # fi
+          
+          echo "✅ 生产环境验证通过"
+      
+      - name: 获取访问地址
+        id: service
+        run: |
+          # 获取外部访问地址
+          EXTERNAL_IP=$(kubectl get svc gva-web -n ${{ env.K8S_NAMESPACE }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+          EXTERNAL_HOSTNAME=$(kubectl get svc gva-web -n ${{ env.K8S_NAMESPACE }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+          
+          if [ -n "$EXTERNAL_IP" ]; then
+            ACCESS_URL="http://${EXTERNAL_IP}"
+          elif [ -n "$EXTERNAL_HOSTNAME" ]; then
+            ACCESS_URL="http://${EXTERNAL_HOSTNAME}"
+          else
+            ACCESS_URL="https://www.yourdomain.com"
+          fi
+          
+          echo "ACCESS_URL=${ACCESS_URL}" >> $GITHUB_OUTPUT
+          echo "🌐 访问地址: ${ACCESS_URL}"
+      
+      - name: 记录部署历史
+        run: |
+          echo "📝 记录部署历史..."
+          
+          # 添加部署标签
+          kubectl annotate deployment gva-server \
+            deployment.kubernetes.io/revision-date="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            deployment.kubernetes.io/deployed-by="${GITHUB_ACTOR}" \
+            deployment.kubernetes.io/version="${{ steps.version.outputs.TAG }}" \
+            -n ${{ env.K8S_NAMESPACE }} --overwrite
+          
+          kubectl annotate deployment gva-web \
+            deployment.kubernetes.io/revision-date="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            deployment.kubernetes.io/deployed-by="${GITHUB_ACTOR}" \
+            deployment.kubernetes.io/version="${{ steps.version.outputs.TAG }}" \
+            -n ${{ env.K8S_NAMESPACE }} --overwrite
+          
+          echo "✅ 部署历史已记录"
+      
+      - name: 发送部署成功通知
+        if: success()
+        run: |
+          DEPLOY_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+          
+          # 企业微信通知
+          if [ -n "${{ secrets.WECOM_WEBHOOK }}" ]; then
+            curl -X POST ${{ secrets.WECOM_WEBHOOK }} \
+              -H 'Content-Type: application/json' \
+              -d "{
+                \"msgtype\": \"markdown\",
+                \"markdown\": {
+                  \"content\": \"## ✅ 生产环境部署成功\n\n>版本: **${{ steps.version.outputs.TAG }}**\n>部署时间: **${DEPLOY_TIME}**\n>部署人: **${GITHUB_ACTOR}**\n>访问地址: **${{ steps.service.outputs.ACCESS_URL }}**\n\n[查看详情](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})\"
+                }
+              }"
+          fi
+          
+          # 钉钉通知
+          if [ -n "${{ secrets.DINGTALK_WEBHOOK }}" ]; then
+            curl -X POST ${{ secrets.DINGTALK_WEBHOOK }} \
+              -H 'Content-Type: application/json' \
+              -d "{
+                \"msgtype\": \"markdown\",
+                \"markdown\": {
+                  \"title\": \"生产环境部署成功\",
+                  \"text\": \"### ✅ 生产环境部署成功\n\n**版本**: ${{ steps.version.outputs.TAG }}\n\n**部署时间**: ${DEPLOY_TIME}\n\n**部署人**: ${GITHUB_ACTOR}\n\n**访问地址**: ${{ steps.service.outputs.ACCESS_URL }}\n\n[查看详情](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})\"
+                }
+              }"
+          fi
+      
+      - name: 部署失败时回滚
+        if: failure()
+        run: |
+          echo "❌ 生产环境部署失败，开始自动回滚..."
+          
+          # 回滚到上一版本
+          kubectl rollout undo deployment/gva-server -n ${{ env.K8S_NAMESPACE }} || true
+          kubectl rollout undo deployment/gva-web -n ${{ env.K8S_NAMESPACE }} || true
+          
+          # 等待回滚完成
+          kubectl rollout status deployment/gva-server -n ${{ env.K8S_NAMESPACE }} --timeout=10m || true
+          kubectl rollout status deployment/gva-web -n ${{ env.K8S_NAMESPACE }} --timeout=10m || true
+          
+          echo "✅ 已回滚到上一版本"
+          
+          # 发送失败通知
+          if [ -n "${{ secrets.WECOM_WEBHOOK }}" ]; then
+            curl -X POST ${{ secrets.WECOM_WEBHOOK }} \
+              -H 'Content-Type: application/json' \
+              -d "{
+                \"msgtype\": \"text\",
+                \"text\": {
+                  \"content\": \"❌ 生产环境部署失败！\n版本: ${{ steps.version.outputs.TAG }}\n已自动回滚到上一版本\n请立即检查: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\"
+                },
+                \"mentioned_list\": [\"@all\"]
+              }"
+          fi
+          
+          if [ -n "${{ secrets.DINGTALK_WEBHOOK }}" ]; then
+            curl -X POST ${{ secrets.DINGTALK_WEBHOOK }} \
+              -H 'Content-Type: application/json' \
+              -d "{
+                \"msgtype\": \"text\",
+                \"text\": {
+                  \"content\": \"❌ 生产环境部署失败！\n版本: ${{ steps.version.outputs.TAG }}\n已自动回滚到上一版本\n请立即检查日志\"
+                },
+                \"at\": {
+                  \"isAtAll\": true
+                }
+              }"
+          fi
+          
+          exit 1
+

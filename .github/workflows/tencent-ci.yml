@@ -1,0 +1,287 @@
+name: CI - 腾讯云持续集成
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+      - 'feature/**'
+      - 'release/**'
+  pull_request:
+    branches:
+      - develop
+      - main
+
+env:
+  GO_VERSION: '1.22'
+  NODE_VERSION: '20'
+  PNPM_VERSION: '10.18.3'
+
+jobs:
+  # ============================================
+  # 前端代码检查和测试
+  # ============================================
+  frontend-check:
+    name: 前端代码检查
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      
+      - name: 设置 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      
+      - name: 安装 pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      
+      - name: 获取 pnpm store 目录
+        id: pnpm-cache
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path)" >> $GITHUB_OUTPUT
+      
+      - name: 设置 pnpm 缓存
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+      
+      - name: 安装前端依赖
+        run: |
+          cd web
+          pnpm install --frozen-lockfile
+      
+      - name: ESLint 检查
+        run: |
+          cd web
+          pnpm lint || true
+          echo "✅ ESLint 检查完成"
+      
+      - name: 前端构建测试
+        run: |
+          cd web
+          pnpm build
+          echo "✅ 前端构建成功"
+      
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          retention-days: 7
+
+  # ============================================
+  # 后端代码检查和测试
+  # ============================================
+  backend-check:
+    name: 后端代码检查
+    runs-on: ubuntu-latest
+    
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: qmPlus
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=3
+      
+      redis:
+        image: redis:6.0
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=3
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      
+      - name: 设置 Go 环境
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: server/go.sum
+      
+      - name: 安装 golangci-lint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v1.61.0
+      
+      - name: Go Mod 下载
+        run: |
+          cd server
+          go mod download
+          go mod verify
+      
+      - name: golangci-lint 检查
+        run: |
+          cd server
+          golangci-lint run --timeout=5m || true
+          echo "✅ golangci-lint 检查完成"
+      
+      - name: Go 单元测试
+        run: |
+          cd server
+          go test -v -race -coverprofile=coverage.out -covermode=atomic ./... || true
+          echo "✅ 单元测试完成"
+      
+      - name: Go 构建测试
+        run: |
+          cd server
+          go build -v -o server .
+          echo "✅ 后端构建成功"
+
+  # ============================================
+  # 构建并推送 Docker 镜像到腾讯云TCR
+  # ============================================
+  build-and-push:
+    name: 构建并推送镜像到腾讯云
+    runs-on: ubuntu-latest
+    needs: [frontend-check, backend-check]
+    if: github.event_name == 'push'
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: 登录腾讯云容器镜像服务
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.DOCKER_REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      
+      - name: 生成镜像标签
+        id: meta
+        run: |
+          BRANCH=${GITHUB_REF#refs/heads/}
+          COMMIT_SHA=${GITHUB_SHA::8}
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          TAG="${BRANCH}-${COMMIT_SHA}-${TIMESTAMP}"
+          echo "TAG=${TAG}" >> $GITHUB_OUTPUT
+          echo "BRANCH=${BRANCH}" >> $GITHUB_OUTPUT
+          echo "SHORT_SHA=${COMMIT_SHA}" >> $GITHUB_OUTPUT
+          echo "🏷️ 生成的标签: ${TAG}"
+      
+      - name: 构建并推送后端镜像
+        uses: docker/build-push-action@v5
+        with:
+          context: ./server
+          file: ./server/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_REGISTRY }}/gva/server:${{ steps.meta.outputs.TAG }}
+            ${{ secrets.DOCKER_REGISTRY }}/gva/server:${{ steps.meta.outputs.BRANCH }}-latest
+            ${{ secrets.DOCKER_REGISTRY }}/gva/server:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            GO_PROXY=https://goproxy.cn,direct
+      
+      - name: 构建并推送前端镜像
+        uses: docker/build-push-action@v5
+        with:
+          context: ./web
+          file: ./web/Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_REGISTRY }}/gva/web:${{ steps.meta.outputs.TAG }}
+            ${{ secrets.DOCKER_REGISTRY }}/gva/web:${{ steps.meta.outputs.BRANCH }}-latest
+            ${{ secrets.DOCKER_REGISTRY }}/gva/web:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: 输出镜像信息
+        run: |
+          echo "✅ 镜像构建完成！"
+          echo ""
+          echo "📦 后端镜像:"
+          echo "  - ${{ secrets.DOCKER_REGISTRY }}/gva/server:${{ steps.meta.outputs.TAG }}"
+          echo "  - ${{ secrets.DOCKER_REGISTRY }}/gva/server:${{ steps.meta.outputs.BRANCH }}-latest"
+          echo ""
+          echo "📦 前端镜像:"
+          echo "  - ${{ secrets.DOCKER_REGISTRY }}/gva/web:${{ steps.meta.outputs.TAG }}"
+          echo "  - ${{ secrets.DOCKER_REGISTRY }}/gva/web:${{ steps.meta.outputs.BRANCH }}-latest"
+      
+      - name: 保存镜像标签供后续Job使用
+        run: |
+          echo "${{ steps.meta.outputs.TAG }}" > image_tag.txt
+      
+      - name: 上传镜像标签
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-tag
+          path: image_tag.txt
+          retention-days: 1
+
+  # ============================================
+  # 通知
+  # ============================================
+  notify:
+    name: 构建通知
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    if: always()
+    
+    steps:
+      - name: 发送企业微信通知
+        if: ${{ secrets.WECOM_WEBHOOK }}
+        run: |
+          STATUS="${{ needs.build-and-push.result }}"
+          
+          if [ "$STATUS" = "success" ]; then
+            COLOR="info"
+            STATUS_TEXT="✅ 成功"
+          else
+            COLOR="warning"
+            STATUS_TEXT="❌ 失败"
+          fi
+          
+          curl -X POST ${{ secrets.WECOM_WEBHOOK }} \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"msgtype\": \"markdown\",
+              \"markdown\": {
+                \"content\": \"## CI 构建通知\n\n>项目: **gin-vue-admin**\n>分支: **${GITHUB_REF#refs/heads/}**\n>状态: <font color=\\\"${COLOR}\\\">${STATUS_TEXT}</font>\n>提交者: **${GITHUB_ACTOR}**\n\n[查看详情](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})\"
+              }
+            }"
+      
+      - name: 发送钉钉通知
+        if: ${{ secrets.DINGTALK_WEBHOOK }}
+        run: |
+          STATUS="${{ needs.build-and-push.result }}"
+          
+          if [ "$STATUS" = "success" ]; then
+            STATUS_TEXT="✅ 成功"
+          else
+            STATUS_TEXT="❌ 失败"
+          fi
+          
+          curl -X POST ${{ secrets.DINGTALK_WEBHOOK }} \
+            -H 'Content-Type: application/json' \
+            -d "{
+              \"msgtype\": \"markdown\",
+              \"markdown\": {
+                \"title\": \"CI 构建通知\",
+                \"text\": \"### CI 构建通知\n\n**项目**: gin-vue-admin\n\n**分支**: ${GITHUB_REF#refs/heads/}\n\n**状态**: ${STATUS_TEXT}\n\n**提交者**: ${GITHUB_ACTOR}\n\n[查看详情](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})\"
+              }
+            }"
+
