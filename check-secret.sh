@@ -1,0 +1,10 @@
+#!/bin/bash
+echo "检查 GitHub Secret 配置"
+echo ""
+echo "请访问："
+echo "https://github.com/djx-ux/-CICD/settings/secrets/actions"
+echo ""
+echo "必须确保有以下 Secret："
+echo "- SERVER_SSH_KEY"
+echo ""
+echo "如果没有，请添加你的完整 SSH 私钥"
